@@ -1,4 +1,4 @@
-# Cash Cows Contrats
+# Cash Cows Contracts
 
 By CAO order of [CCIP4: Open Source](https://dao.wearecashcows.com/#/proposal/0xccb5e6d7e9fa1ed02e9429327b14995bdaa78e6ffc55a01b17a10806df4831b7), 
 The Cash Cows project is now open source. Please observe and respect our
