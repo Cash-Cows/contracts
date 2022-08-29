@@ -2,6 +2,21 @@
 
 pragma solidity ^0.8.0;
 
+//-------------------------------------------------------------------------------------------
+//
+//   /$$$$$$                      /$$              /$$$$$$                                   
+//  /$$__  $$                    | $$             /$$__  $$                                  
+// | $$  \__/  /$$$$$$   /$$$$$$$| $$$$$$$       | $$  \__/  /$$$$$$  /$$  /$$  /$$  /$$$$$$$
+// | $$       |____  $$ /$$_____/| $$__  $$      | $$       /$$__  $$| $$ | $$ | $$ /$$_____/
+// | $$        /$$$$$$$|  $$$$$$ | $$  \ $$      | $$      | $$  \ $$| $$ | $$ | $$|  $$$$$$ 
+// | $$    $$ /$$__  $$ \____  $$| $$  | $$      | $$    $$| $$  | $$| $$ | $$ | $$ \____  $$
+// |  $$$$$$/|  $$$$$$$ /$$$$$$$/| $$  | $$      |  $$$$$$/|  $$$$$$/|  $$$$$/$$$$/ /$$$$$$$/
+//  \______/  \_______/|_______/ |__/  |__/       \______/  \______/  \_____/\___/ |_______/
+//
+//-------------------------------------------------------------------------------------------
+//
+// Moo.
+
 import "@openzeppelin/contracts/utils/Context.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
@@ -15,6 +30,7 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 
 import "../IERC20Burnable.sol";
+import "../IERC20Mintable.sol";
 
 // ============ Interface ============
 
@@ -29,28 +45,25 @@ interface IERC1155Mintable is IERC1155, IERC1155Receiver {
 
 // ============ Contract ============
 
+/**
+ * @dev This links items to characters. Some items are stakable. 
+ * A character can hold only one type of item at a time.
+ */
 contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
+  using Address for address;
+
   // ============ Errors ============
 
   error InvalidCall();
 
   // ============ Events ============
 
-  event Injected(uint256 characterId, uint256 itemId, uint256 amount);
-  event Ejected(uint256 characterId, uint256 itemId, uint256 amount);
+  //emitted when item is linked to character
+  event Linked(uint256 characterId, uint256 itemId);
+  //emitted when item is unlinked from character
+  event Unlinked(uint256 characterId, uint256 itemId);
 
   // ============ Constants ============
-
-  // Bits Layout:
-  // - [0..159]   `address of collection`
-  // - [160..] `tokenId`
-
-  //length of token in packed data
-  uint256 private constant _BIT_TOKEN_MASK = (1 << 192) - 1;
-  //length of collection in packed data
-  uint256 private constant _BIT_COLLECTION_MASK = (1 << 160) - 1;
-  //position of token in packed data
-  uint256 private constant _BIT_TOKEN_POSITION = 160;
 
   bytes32 private constant _FUNDER_ROLE = keccak256("FUNDER_ROLE");
   bytes32 private constant _MINTER_ROLE = keccak256("MINTER_ROLE");
@@ -58,12 +71,15 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
   
   // ============ Storage ============
 
-  //mapping of item id -> character id -> balance
-  mapping(uint256 => mapping(uint256 => uint256)) private _balances; 
-  //checks to see if we should burn this or not
+  //mapping of item id -> character id -> start time
+  mapping(uint256 => mapping(uint256 => uint256)) private _start; 
+  //mapping of item id -> character id -> erc20 token -> last time redeemed
+  mapping(uint256 => mapping(uint256 => mapping(IERC20 => uint256))) private _redeemed;
+  //if minting with erc20, this checks to 
+  //see if we should burn the token or not
   mapping(address => bool) private _burnable;
-  //flag that allows items to be ejected
-  bool private _canEject;
+  //mapping of item id -> whether if it can be unlinked
+  mapping(uint256 => bool) _unlinkable;
   
   // ============ Deploy ============
 
@@ -77,13 +93,57 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
   // ============ Read Methods ============
 
   /**
-   * @dev Returns of the `itemId` balance of the `characterId`
+   * @dev Returns of the time when `itemId` was linked with `characterId`
    */
-  function balanceOf(
+  function linkedSince(
     uint256 characterId, 
     uint256 itemId
   ) external view returns(uint256) {
-    return _balances[itemId][characterId];
+    return _start[itemId][characterId];
+  }
+
+  /**
+   * @dev Calculate how many a `token` a `characterId` `itemId` earned
+   * given the `rate`
+   */
+  function redeemable(
+    IERC20 token, 
+    uint256 characterId, 
+    uint256 itemId,
+    uint256 rate
+  ) public view returns(uint256) {
+    return redeemable(token, characterId, itemId, block.timestamp, rate);
+  }
+
+  /**
+   * @dev Calculate how many a `token` a `characterId` `itemId` earned
+   * given the `timestamp` and `rate`
+   */
+  function redeemable(
+    IERC20 token, 
+    uint256 characterId, 
+    uint256 itemId,
+    uint256 timestamp,
+    uint256 rate
+  ) public view returns(uint256) {
+    uint256 start = redeemed(token, characterId, itemId);
+    if (start == 0) return 0;
+    //FORMULA: duration * rate
+    return (timestamp - start) * rate;
+  }
+
+  /**
+   * @dev Returns the last time this was redeemed were already 
+   * released for `collection` `tokenId`
+   */
+  function redeemed(
+    IERC20 token,
+    uint256 characterId, 
+    uint256 itemId
+  ) public view returns(uint256) {
+    return _start[itemId][characterId] > _redeemed[itemId][characterId][token]
+      ? _start[itemId][characterId]
+      : _redeemed[itemId][characterId][token];
   }
 
   // ============ Handler Methods ============
@@ -121,15 +181,16 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
   // ============ Write Methods ============
 
   /**
-   * @dev Allows anyone to inject an `amount` of `itemId` they 
+   * @dev Allows anyone to deposit an `amount` of `itemId` they 
    * own to a `characterId`. This includes even gifting.
    */
-  function inject(
+  function link(
     uint256 characterId, 
-    uint256 itemId, 
-    uint256 amount,
+    uint256 itemId,
     bytes calldata data
   ) public {
+    //link first
+    _link(characterId, itemId);
     ( //get the item address and item token id
       address itemAddress, 
       uint256 itemTokenId
@@ -139,46 +200,7 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
       _msgSender(),
       address(this),
       itemTokenId,
-      amount,
-      data
-    );
-    //add to character item balance
-    _balances[itemId][characterId] += amount;
-    //emit injected
-    emit Injected(characterId, itemId, amount);
-  }
-
-  /**
-   * @dev Allows the owner of the `characterId` to eject an `amount` 
-   * of `itemId` back to them.
-   */
-  function eject(
-    uint256 characterId, 
-    uint256 itemId, 
-    uint256 amount,
-    address to,
-    bytes calldata data
-  ) external {
-    //revert if cant eject
-    if (!_canEject) revert InvalidCall();
-
-    ( //get the character address and character id
-      address characterAddress, 
-      uint256 characterTokenId
-    ) = _unpackCollection(characterId);
-
-    try IERC721(characterAddress).ownerOf(characterTokenId)
-    returns(address owner) {
-      if (owner != _msgSender()) revert InvalidCall();
-    } catch(bytes memory) {
-      revert InvalidCall();
-    }
-
-    _eject(
-      characterId, 
-      itemId, 
-      amount, 
-      to, 
+      1,
       data
     );
   }
@@ -191,13 +213,12 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
     uint256 characterId, 
     uint256 itemId,
     uint256 price,
-    uint256 amount,
     bytes memory proof
   ) external payable {
     //revert if no price 
     if (price == 0 
       //or if the eth sent was less than the price
-      || msg.value < (price * amount)
+      || msg.value < price
       //or invalid proof
       || !hasRole(_MINTER_ROLE, ECDSA.recover(
         ECDSA.toEthSignedMessageHash(
@@ -212,7 +233,7 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
       ))
     ) revert InvalidCall();
     
-    _mint(characterId, itemId, amount);
+    _mint(characterId, itemId);
   }
 
   /**
@@ -220,11 +241,10 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
    * from the `store` for `token` `price` each, given `proof`
    */
   function mint(
+    address token,
     uint256 characterId, 
     uint256 itemId,
-    address token,
     uint256 price,
-    uint256 amount,
     bytes memory proof
   ) external {
     //revert if no price 
@@ -233,10 +253,10 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
       || !hasRole(_MINTER_ROLE, ECDSA.recover(
         ECDSA.toEthSignedMessageHash(
           keccak256(abi.encodePacked(
-            "mint", 
+            "mint",
+            token, 
             characterId,
             itemId,
-            token,
             price
           ))
         ),
@@ -248,7 +268,7 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
     if (_burnable[token]) {
       //burn it. muhahaha
       //(the payer is the caller)
-      IERC20Burnable(token).burnFrom(_msgSender(), price * amount);
+      IERC20Burnable(token).burnFrom(_msgSender(), price);
     } else {
       //transfer it here
       //(the payer is the caller)
@@ -256,21 +276,68 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
       IERC20(token).transferFrom(
         _msgSender(), 
         address(this), 
-        price * amount
+        price
       );
     }
     
-    _mint(characterId, itemId, amount);
+    _mint(characterId, itemId);
   }
 
   /**
-   * @dev Allows anyone to safely inject an `amount` of `itemId` they 
+   * @dev Redeem tokens for an item. Rate is determined off chain.
+   */
+  function redeem(
+    IERC20Mintable token, 
+    uint256 characterId,
+    uint256 itemId,
+    uint256 rate, 
+    bytes memory proof
+  ) external {
+    //revert if invalid proof
+    if (!hasRole(_MINTER_ROLE, ECDSA.recover(
+      ECDSA.toEthSignedMessageHash(
+        keccak256(abi.encodePacked(
+          "redeem", 
+          address(token),
+          itemId,
+          rate
+        ))
+      ),
+      proof
+    ))) revert InvalidCall();
+    //get the staker
+    address staker = _msgSender();
+    ( //get the character address and character token id
+      address characterAddress, 
+      uint256 characterTokenId
+    ) = _unpackCollection(characterId);
+    //if not owner
+    if (IERC721(characterAddress).ownerOf(characterTokenId) != staker) 
+      revert InvalidCall();
+
+    //get pending
+    uint256 pending = redeemable(token, characterId, itemId, rate);
+    //update time
+    _redeemed[itemId][characterId][token] = block.timestamp;
+
+    //next mint tokens
+    address(token).functionCall(
+      abi.encodeWithSelector(
+        IERC20Mintable(token).mint.selector, 
+        staker, 
+        pending
+      ), 
+      "Low-level mint failed"
+    );
+  }
+
+  /**
+   * @dev Allows anyone to safely deposit an `amount` of `itemId` they 
    * own to a `characterId`. This includes even gifting.
    */
-  function safeInject(
+  function safeLink(
     uint256 characterId, 
     uint256 itemId, 
-    uint256 amount,
     bytes calldata data
   ) external {
     ( //get the character address and character id
@@ -285,7 +352,33 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
       revert InvalidCall();
     }
 
-    inject(characterId, itemId, amount, data);
+    link(characterId, itemId, data);
+  }
+
+  /**
+   * @dev Allows the owner of the `characterId` to withdraw an `amount` 
+   * of `itemId` back to them.
+   */
+  function unlink(
+    uint256 characterId, 
+    uint256 itemId, 
+    address to,
+    bytes calldata data
+  ) external {
+    //revert if item is unlinkable
+    if (!_unlinkable[itemId]) revert InvalidCall();
+    ( //get the character address and character id
+      address characterAddress, 
+      uint256 characterTokenId
+    ) = _unpackCollection(characterId);
+    try IERC721(characterAddress).ownerOf(characterTokenId)
+    returns(address owner) {
+      if (owner != _msgSender()) revert InvalidCall();
+    } catch(bytes memory) {
+      revert InvalidCall();
+    }
+
+    _unlink(characterId, itemId, to, data);
   }
   
   // ============ Admin Methods ============
@@ -294,42 +387,11 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
    * @dev Sets a token address that we will be burning when used on 
    * minting. This is like MILK or DOLLA
    */
-  function burnTokens(
+  function burnable(
     IERC20 token, 
-    bool burnable
+    bool yes
   ) external onlyRole(_CURATOR_ROLE) {
-    _burnable[address(token)] = burnable;
-  }
-
-  /**
-   * @dev Allows admin to `characterId` to eject an `amount` 
-   * of `itemId` back to them.
-   */
-  function eject(
-    uint256 characterId, 
-    uint256 itemId, 
-    uint256 amount,
-    bytes calldata data
-  ) external onlyRole(_CURATOR_ROLE) {
-    ( //get the character address and character id
-      address characterAddress, 
-      uint256 characterTokenId
-    ) = _unpackCollection(characterId);
-    //can only eject
-    _eject(
-      characterId, 
-      itemId, 
-      amount, 
-      IERC721(characterAddress).ownerOf(characterTokenId), 
-      data
-    );
-  }
-
-  /**
-   * @dev Allows/revokes the ability for items to be ejected
-   */
-  function ejectable(bool yes) external onlyRole(_CURATOR_ROLE) {
-    _canEject = yes;
+    _burnable[address(token)] = yes;
   }
 
   /**
@@ -338,10 +400,41 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
    */
   function mint(
     uint256 characterId, 
-    uint256 itemId,
-    uint256 amount
+    uint256 itemId
   ) external onlyRole(_MINTER_ROLE) {
-    _mint(characterId, itemId, amount);
+    _mint(characterId, itemId);
+  }
+
+  /**
+   * @dev Allows admin to `characterId` to withdraw an `amount` 
+   * of `itemId` back to them.
+   */
+  function unlink(
+    uint256 characterId, 
+    uint256 itemId, 
+    bytes calldata data
+  ) external onlyRole(_CURATOR_ROLE) {
+    ( //get the character address and character id
+      address characterAddress, 
+      uint256 characterTokenId
+    ) = _unpackCollection(characterId);
+    //can only withdraw
+    _unlink(
+      characterId, 
+      itemId, 
+      IERC721(characterAddress).ownerOf(characterTokenId), 
+      data
+    );
+  }
+
+  /**
+   * @dev Allows/revokes the ability for items to be unlinked
+   */
+  function unlinkable(
+    uint256 itemId, 
+    bool yes
+  ) external onlyRole(_CURATOR_ROLE) {
+    _unlinkable[itemId] = yes;
   }
 
   /**
@@ -367,61 +460,78 @@ contract CashCowsGame is Context, ReentrancyGuard, AccessControl {
   // ============ Internal Methods ============
 
   /**
-   * @dev Allows the owner of the `characterId` to eject an `amount` 
-   * of `itemId` back to them.
-   */
-  function _eject(
-    uint256 characterId, 
-    uint256 itemId, 
-    uint256 amount,
-    address to,
-    bytes calldata data
-  ) internal {
-    //revert if character item balance is less than the amount given
-    if (_balances[itemId][characterId] < amount) revert InvalidCall();
-    
-    ( //get the item address and item token id
-      address itemAddress, 
-      uint256 itemTokenId
-    ) = _unpackCollection(itemId);
-    
-    //try to transfer out to the intended recipient
-    IERC1155(itemAddress).safeTransferFrom(
-      address(this),
-      to,
-      itemTokenId,
-      amount,
-      data
-    );
-
-    unchecked { //less the balace
-      _balances[itemId][characterId] -= amount;  
-    }
-    
-    //emit injected
-    emit Ejected(characterId, itemId, amount);
-  }
-
-  /**
    * @dev Mints an `amount` of `itemId` for `characterId`   
    * from the `store` for `token` `price` each, given `proof`
    */
   function _mint(
     uint256 characterId, 
-    uint256 itemId,
-    uint256 amount
+    uint256 itemId
   ) internal {
+    //first link
+    _link(characterId, itemId);
     ( //get the item address and item token id
       address itemAddress, 
       uint256 itemTokenId
     ) = _unpackCollection(itemId);
     //mint to this address
-    IERC1155Mintable(itemAddress).mint(address(this), itemTokenId, amount, "");
+    IERC1155Mintable(itemAddress).mint(address(this), itemTokenId, 1, "");
+  }
+
+  /**
+   * @dev Allows anyone to deposit an `amount` of `itemId` they 
+   * own to a `characterId`. This includes even gifting.
+   */
+  function _link(uint256 characterId, uint256 itemId) internal {
+    //revert if already linked
+    if (_start[itemId][characterId] > 0) revert InvalidCall();
     //add to character item balance
-    _balances[itemId][characterId] += amount;
+    _start[itemId][characterId] = block.timestamp;
+    //emit deposited
+    emit Linked(characterId, itemId);
+  }
+
+  /**
+   * @dev Allows the owner of the `characterId` to withdraw an `amount` 
+   * of `itemId` back to them.
+   */
+  function _unlink(
+    uint256 characterId, 
+    uint256 itemId, 
+    address to,
+    bytes calldata data
+  ) internal {
+    //revert if character item is not staked
+    if (_start[itemId][characterId] == 0) revert InvalidCall();
+    ( //get the item address and item token id
+      address itemAddress, 
+      uint256 itemTokenId
+    ) = _unpackCollection(itemId);
+    //try to transfer out to the intended recipient
+    IERC1155(itemAddress).safeTransferFrom(
+      address(this),
+      to,
+      itemTokenId,
+      1,
+      data
+    );
+    //remove start time
+    delete _start[itemId][characterId];
+    //emit unlinked
+    emit Unlinked(characterId, itemId);
   }
   
   // ============ Pack Methods ============
+
+  // Bits Layout:
+  // - [0..159]   `address of collection`
+  // - [160..] `tokenId`
+
+  //length of token in packed data
+  uint256 private constant _BIT_TOKEN_MASK = (1 << 192) - 1;
+  //length of collection in packed data
+  uint256 private constant _BIT_COLLECTION_MASK = (1 << 160) - 1;
+  //position of token in packed data
+  uint256 private constant _BIT_TOKEN_POSITION = 160;
 
   /**
    * @dev Unpacks collection data from uint256 `packed`
