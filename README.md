@@ -2,7 +2,7 @@
 
 By CAO order of [CCIP4: Open Source](https://dao.wearecashcows.com/#/proposal/0xccb5e6d7e9fa1ed02e9429327b14995bdaa78e6ffc55a01b17a10806df4831b7), 
 The Cash Cows project is now open source. Please observe and respect our
-[open source license](https://github.com/Cash-Cows/artengine/blob/main/LICENSE).
+[open source license](https://github.com/Cash-Cows/contracts/blob/main/LICENSE).
 
 ```
 Cows do not guarantee that this code, is the one actually used right now.
